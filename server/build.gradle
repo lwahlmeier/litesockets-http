@@ -1,5 +1,3 @@
-apply from: "${rootDir}/build.gradle.shared"
-
 project.archivesBaseName='litesockets-http-server'
 
 dependencies {
