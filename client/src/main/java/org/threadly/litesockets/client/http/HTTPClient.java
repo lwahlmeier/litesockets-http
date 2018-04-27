@@ -5,6 +5,7 @@ import java.io.InputStream;
 import java.net.URL;
 import java.nio.ByteBuffer;
 import java.util.ArrayDeque;
+import java.util.Iterator;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -42,6 +43,7 @@ import org.threadly.litesockets.utils.IOUtils;
 import org.threadly.litesockets.utils.SSLUtils;
 import org.threadly.util.AbstractService;
 import org.threadly.util.Clock;
+import org.threadly.util.Pair;
 
 /**
  * <p>This is a HTTPClient for doing many simple HTTPRequests.  Every request will be make a new connection and requests
@@ -51,6 +53,7 @@ import org.threadly.util.Clock;
 public class HTTPClient extends AbstractService {
   public static final int DEFAULT_CONCURRENT = 2;
   public static final int DEFAULT_TIMEOUT = 15000;
+  public static final int DEFAULT_MAX_IDLE = 45000;
   public static final int MAX_HTTP_RESPONSE = 1048576;  //1MB
 
   private final int maxResponseSize;
@@ -58,13 +61,15 @@ public class HTTPClient extends AbstractService {
   private final SocketExecuter sei;
   private final ConcurrentLinkedQueue<HTTPRequestWrapper> queue = new ConcurrentLinkedQueue<>();
   private final ConcurrentHashMap<TCPClient, HTTPRequestWrapper> inProcess = new ConcurrentHashMap<>();
-  private final ConcurrentHashMap<HTTPAddress, ArrayDeque<TCPClient>> sockets = new ConcurrentHashMap<>();
+  private final ConcurrentHashMap<HTTPAddress, ArrayDeque<Pair<Long,TCPClient>>> sockets = new ConcurrentHashMap<>();
   private final CopyOnWriteArraySet<TCPClient> tcpClients = new CopyOnWriteArraySet<>();
   private final MainClientProcessor mcp = new MainClientProcessor();
   private final RunSocket runSocketTask;
   private final int maxConcurrent;
+  private volatile Runnable checkIdle = null;
   private volatile int defaultTimeout = DEFAULT_TIMEOUT;
   private volatile SSLContext sslContext = SSLUtils.OPEN_SSL_CTX;
+  private volatile long maxIdleTime = DEFAULT_MAX_IDLE;
 
   private NoThreadSocketExecuter ntse = null;
   private SingleThreadScheduler sts = null;
@@ -170,6 +175,30 @@ public class HTTPClient extends AbstractService {
    */
   public void setTimeout(int timeout) {
     this.defaultTimeout = timeout;
+  }
+  
+  public long getMaxIdleTimeout() {
+    return this.maxIdleTime;
+
+  }
+
+  /**
+   * Sets the max amount of time we will hold onto idle connections.  A 0 means we close connections when done, less
+   * than zero means we will never expire connections.
+   * 
+   * @param it the time in milliseconds to wait before timing out a connection.
+   */
+  public void setMaxIdleTimeout(long it) {
+    this.maxIdleTime = it;
+    if(this.maxIdleTime > 0) {
+      this.checkIdle = ()->{
+        if(checkIdle == this) {
+          this.checkIdleSockets();
+          this.ssi.schedule(checkIdle, Math.max(100, maxIdleTime/2));
+        }
+      };
+      this.ssi.schedule(checkIdle, Math.max(100, maxIdleTime/2));
+    }
   }
 
   /**
@@ -379,6 +408,7 @@ public class HTTPClient extends AbstractService {
     if (ntse != null) {
       ntse.start();
     }
+    setMaxIdleTimeout(this.maxIdleTime);
   }
 
   @Override
@@ -398,18 +428,18 @@ public class HTTPClient extends AbstractService {
   }
 
   private TCPClient getTCPClient(final HTTPAddress ha) throws IOException {
-    ArrayDeque<TCPClient> ll = sockets.get(ha);
+    ArrayDeque<Pair<Long,TCPClient>> pl = sockets.get(ha);
     TCPClient tc = null;
-    if(ll != null) {
-      synchronized(ll) {
-        while(ll.size() > 0 && tc == null) {
-          if(ll.peek().isClosed()) {
-            ll.pop();
+    if(pl != null) {
+      synchronized(pl) {
+        while(pl.size() > 0 && tc == null) {
+          if(pl.peek().getRight().isClosed()) {
+            pl.pop();
           } else {
-            tc = ll.pop();
+            tc = pl.pop().getRight();
           }
         }
-        if(ll.size() == 0) {
+        if(pl.size() == 0) {
           sockets.remove(ha);
         }
       }
@@ -431,14 +461,53 @@ public class HTTPClient extends AbstractService {
   }
 
   private void addBackTCPClient(final HTTPAddress ha, final TCPClient client) {
+    if(maxIdleTime == 0) {
+      client.close();
+      return;
+    }
+    if(tcpClients.size() > this.maxConcurrent) {
+      limitConnections();
+    }
     if(!client.isClosed()) {
-      ArrayDeque<TCPClient> ll = sockets.get(ha);  
+      ArrayDeque<Pair<Long,TCPClient>> ll = sockets.get(ha);  
       if(ll == null) {
         sockets.put(ha, new ArrayDeque<>(8));
         ll = sockets.get(ha);
       }
       synchronized(ll) {
-        ll.add(client);
+        ll.add(new Pair<Long, TCPClient>(Clock.lastKnownForwardProgressingMillis(), client));
+      }
+    }
+  }
+  
+  private void limitConnections() {
+    if(tcpClients.size() > this.maxConcurrent) {
+      for(ArrayDeque<Pair<Long,TCPClient>> adq: sockets.values()) {
+        synchronized(adq) {
+          Iterator<Pair<Long,TCPClient>> iter = adq.iterator();
+          while(iter.hasNext()) {
+            Pair<Long,TCPClient> c = iter.next();
+            iter.remove();
+            c.getRight().close();
+          }
+        }
+      }
+    }
+  }
+  
+  private void checkIdleSockets() {
+    if(maxIdleTime > 0) {
+      for(ArrayDeque<Pair<Long,TCPClient>> adq: sockets.values()) {
+        synchronized(adq) {
+          Iterator<Pair<Long,TCPClient>> iter = adq.iterator();
+          while(iter.hasNext()) {
+            Pair<Long,TCPClient> c = iter.next();
+            if(Clock.lastKnownForwardProgressingMillis() - c.getLeft() > maxIdleTime) {
+              iter.remove();
+              c.getRight().close();
+            }
+          }
+        }
       }
     }
   }
@@ -620,3 +689,4 @@ public class HTTPClient extends AbstractService {
     }
   }
 }
+
